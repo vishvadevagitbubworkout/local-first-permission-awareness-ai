@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from threading import RLock
 
-from app.security.capabilities import UsagePolicy
-from app.security.verification import CapabilityVerificationError, VerifiedCapability
+from app.core.config import AUTOMATION_STATE_DB
+from app.storage.local_store import LocalAutomationStore
+from app.security.tokens import AuthenticatedCapability, UsagePolicy
+from app.security.verification import CapabilityVerificationError, CapabilityVerifier, VerifiedCapability
+from app.security.tokens import CapabilityKeyProvider
 
 
 class CapabilityLifecycleState(str, Enum):
@@ -35,30 +37,57 @@ class CapabilityStateError(CapabilityLifecycleError):
     """Raised for invalid lifecycle transitions or untrusted inputs."""
 
 
-class _LifecycleRecord:
-    def __init__(self):
-        self.state = CapabilityLifecycleState.ACTIVE
-
-
 class CapabilityLifecycleStore:
-    """Process-local lifecycle state for verified capabilities.
+    """Persistent, cross-process lifecycle state for verified capabilities."""
 
-    This store prevents replay within this process. It does not provide
-    cross-process or distributed replay protection.
-    """
+    def __init__(
+        self,
+        *,
+        verifier: CapabilityVerifier | None = None,
+        store: LocalAutomationStore | None = None,
+    ):
+        self._verifier = verifier or CapabilityVerifier(
+            key_provider=CapabilityKeyProvider()
+        )
+        self.store = store or LocalAutomationStore(AUTOMATION_STATE_DB)
 
-    def __init__(self):
-        self._records: dict[str, _LifecycleRecord] = {}
-        self._lock = RLock()
+    def _require_verified(
+        self,
+        capability: AuthenticatedCapability | VerifiedCapability,
+        *,
+        now: datetime | None = None,
+    ) -> VerifiedCapability:
+        if isinstance(capability, VerifiedCapability):
+            capability = AuthenticatedCapability(
+                claims=capability.claims,
+                mac=capability.mac,
+            )
+        if not isinstance(capability, AuthenticatedCapability):
+            raise CapabilityStateError("lifecycle requires an authenticated capability")
+        try:
+            return self._verifier.verify(capability, now=now)
+        except CapabilityVerificationError as error:
+            if "expired" in str(error).lower():
+                try:
+                    return self._verifier.verify(
+                        capability,
+                        now=capability.claims.issued_at,
+                    )
+                except CapabilityVerificationError:
+                    pass
+            raise CapabilityStateError(
+                "lifecycle requires a capability with a valid MAC and expiry"
+            ) from error
 
     @staticmethod
-    def _require_verified(capability: VerifiedCapability) -> None:
-        if not isinstance(capability, VerifiedCapability) or not capability.is_verified():
-            raise CapabilityStateError("lifecycle requires a genuine VerifiedCapability")
-
-    @staticmethod
-    def _key(capability: VerifiedCapability) -> str:
-        return f"{capability.claims.capability_id}:{capability.claims.nonce}"
+    def _store_claims(capability: VerifiedCapability) -> dict[str, str]:
+        claims = capability.claims
+        return {
+            "capability_id": claims.capability_id,
+            "nonce": claims.nonce,
+            "expires_at": claims.expires_at.astimezone(timezone.utc).isoformat(),
+            "usage_policy": claims.usage_policy.value,
+        }
 
     @staticmethod
     def _now(now: datetime | None) -> datetime:
@@ -67,17 +96,14 @@ class CapabilityLifecycleStore:
             raise CapabilityStateError("lifecycle time must be timezone-aware")
         return current.astimezone(timezone.utc)
 
-    def _record_for(self, capability: VerifiedCapability) -> _LifecycleRecord:
-        return self._records.setdefault(self._key(capability), _LifecycleRecord())
-
     def state(self, capability: VerifiedCapability, *, now: datetime | None = None) -> CapabilityLifecycleState:
-        self._require_verified(capability)
+        capability = self._require_verified(capability, now=now)
         current = self._now(now)
-        with self._lock:
-            record = self._record_for(capability)
-            if record.state == CapabilityLifecycleState.ACTIVE and current >= capability.claims.expires_at:
-                record.state = CapabilityLifecycleState.EXPIRED
-            return record.state
+        state = self.store.get_capability_state(
+            **self._store_claims(capability),
+            now=current,
+        )
+        return CapabilityLifecycleState(state)
 
     def check_usable(self, capability: VerifiedCapability, *, now: datetime | None = None) -> VerifiedCapability:
         current_state = self.state(capability, now=now)
@@ -96,36 +122,37 @@ class CapabilityLifecycleStore:
         now: datetime | None = None,
     ) -> VerifiedCapability:
         """Atomically check and consume a one-time capability."""
-        self._require_verified(capability)
+        capability = self._require_verified(capability, now=now)
         current = self._now(now)
-        with self._lock:
-            record = self._record_for(capability)
-            if record.state == CapabilityLifecycleState.ACTIVE and current >= capability.claims.expires_at:
-                record.state = CapabilityLifecycleState.EXPIRED
-            if record.state == CapabilityLifecycleState.EXPIRED:
-                raise CapabilityExpiredError("capability is expired")
-            if record.state == CapabilityLifecycleState.REVOKED:
-                raise CapabilityRevokedError("capability is revoked")
-            if record.state == CapabilityLifecycleState.USED:
-                raise CapabilityReplayError("one-time capability has already been used")
-            if capability.claims.usage_policy == UsagePolicy.ONE_TIME:
-                record.state = CapabilityLifecycleState.USED
+        state = self.store.consume_capability(
+            **self._store_claims(capability),
+            now=current,
+        )
+        if state == "CONSUMED":
             return capability
+        if state == CapabilityLifecycleState.EXPIRED.value:
+            raise CapabilityExpiredError("capability is expired")
+        if state == CapabilityLifecycleState.REVOKED.value:
+            raise CapabilityRevokedError("capability is revoked")
+        if state == CapabilityLifecycleState.USED.value:
+            raise CapabilityReplayError("one-time capability has already been used")
+        return capability
 
     def revoke(self, capability: VerifiedCapability, *, now: datetime | None = None) -> None:
-        self._require_verified(capability)
+        capability = self._require_verified(capability, now=now)
         current = self._now(now)
-        with self._lock:
-            record = self._record_for(capability)
-            if record.state == CapabilityLifecycleState.ACTIVE and current >= capability.claims.expires_at:
-                record.state = CapabilityLifecycleState.EXPIRED
-            if record.state == CapabilityLifecycleState.USED:
-                raise CapabilityStateError("used capability cannot be revoked")
-            if record.state == CapabilityLifecycleState.EXPIRED:
-                raise CapabilityStateError("expired capability cannot be revoked")
-            if record.state == CapabilityLifecycleState.REVOKED:
-                raise CapabilityStateError("capability is already revoked")
-            record.state = CapabilityLifecycleState.REVOKED
+        state = self.store.revoke_capability(
+            **self._store_claims(capability),
+            now=current,
+        )
+        if state == "REVOKED_NOW":
+            return
+        if state == CapabilityLifecycleState.USED.value:
+            raise CapabilityStateError("used capability cannot be revoked")
+        if state == CapabilityLifecycleState.EXPIRED.value:
+            raise CapabilityStateError("expired capability cannot be revoked")
+        if state == CapabilityLifecycleState.REVOKED.value:
+            raise CapabilityStateError("capability is already revoked")
 
 
 __all__ = [

@@ -6,10 +6,10 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, PrivateAttr, TypeAdapter
 
-from app.permissions.policies import PermissionScope
-from app.security.capabilities import AuthenticatedCapability, CapabilityClaims, UsagePolicy
-from app.security.crypto import verify_mac
-from app.security.key_provider import CapabilityKeyProvider
+from app.security.permissions import PermissionScope
+from app.security.tokens import AuthenticatedCapability, CapabilityClaims, UsagePolicy
+from app.security.tokens import verify_mac
+from app.security.tokens import CapabilityKeyProvider
 
 _VERIFIED_TOKEN = object()
 
@@ -28,7 +28,13 @@ class VerifiedCapability(BaseModel):
     _verified_token: object | None = PrivateAttr(default=None)
 
     @classmethod
-    def _from_verifier(cls, capability: AuthenticatedCapability) -> "VerifiedCapability":
+    def _from_verifier(
+        cls, capability: AuthenticatedCapability, *, issuer: object
+    ) -> "VerifiedCapability":
+        if issuer is not _VERIFIED_TOKEN:
+            raise CapabilityVerificationError(
+                "verified capability issuance is restricted to the verifier"
+            )
         verified = cls(claims=capability.claims, mac=capability.mac)
         verified._verified_token = _VERIFIED_TOKEN
         return verified
@@ -91,7 +97,9 @@ class CapabilityVerifier:
             expected_resource=expected_resource,
             expected_scope=expected_scope,
         )
-        return VerifiedCapability._from_verifier(authenticated)
+        return VerifiedCapability._from_verifier(
+            authenticated, issuer=_VERIFIED_TOKEN
+        )
 
     @staticmethod
     def _parse_raw(capability: AuthenticatedCapability | dict[str, Any] | str) -> tuple[dict[str, Any], str]:

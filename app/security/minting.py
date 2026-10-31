@@ -5,14 +5,14 @@ import secrets
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.capabilities.registry import CapabilityRegistryError
-from app.capabilities.resolver import CapabilityResolver
-from app.permissions.authorization import AuthorizationResult
-from app.permissions.policies import PermissionDecision
-from app.planner.schemas import PlanStep, TaskPlan
-from app.security.capabilities import AuthenticatedCapability, CapabilityClaims, UsagePolicy
-from app.security.crypto import compute_mac
-from app.security.key_provider import CapabilityKeyProvider
+from app.security.capabilities import CapabilityRegistryError
+from app.security.capabilities import CapabilityResolver
+from app.security.permissions import AuthorizationResult
+from app.security.permissions import PermissionDecision
+from app.core.task_plan import PlanStep, TaskPlan
+from app.security.tokens import AuthenticatedCapability, CapabilityClaims, UsagePolicy
+from app.security.tokens import compute_mac
+from app.security.tokens import CapabilityKeyProvider
 
 _MAX_LIFETIME = timedelta(hours=1)
 _DEFAULT_LIFETIME = timedelta(minutes=5)

@@ -1,111 +1,107 @@
-from app.capabilities.registry import CapabilityRegistryError
-from app.capabilities.templates import ResourceType
-from app.intent.parsing import IntentParsingError
-from app.intent.schemas import IntentCheckResult
-from app.intent.validator import IntentValidator
-from app.permissions.authorization import TaskAuthorizationManager
-from app.permissions.policies import PermissionScope, PermissionScopeKind
-from app.planner.ollama_client import OllamaError
-from app.planner.planner import Planner
-from app.planner.parsing import PlanParsingError
-from app.planner.schemas import TaskPlan
-from app.pipeline import M1M5Pipeline
+from app.validation.intent import IntentParsingError
+from app.providers.ollama import OllamaError
+from app.agents.planner import PlanParsingError
+from app.security.capabilities import CapabilityRegistryError
+from app.security.lifecycle import CapabilityLifecycleError
+from app.skills.file_executor import M6ExecutionError
+from app.workflow.pipeline import M1M6Pipeline
+from app.skills.registry import PreparedSkillAction
+from app.skills.registry import SkillRegistryError
+from app.security.permissions import AuthorizationResult
+from app.core.task_plan import PlanStep
 
 
-def format_plan(plan: TaskPlan) -> str:
-	lines = [
-		"Generated Plan:",
-		"",
-		f"Task ID: {plan.task_id}",
-		"",
-	]
-
-	for index, step in enumerate(plan.steps, start=1):
-		lines.extend(
-			[
-				f"Step {index}",
-				f"Agent: {step.agent}",
-				f"Operation: {step.operation}",
-				f"Template: {step.template.value if step.template else 'legacy/unspecified'}",
-				f"Intent: {step.intent.value if step.intent else 'legacy/unspecified'}",
-				f"Resource: {step.resource}",
-				f"Opaque File Refs: {step.opaque_file_refs}",
-				f"Description: {step.description or 'legacy/unspecified'}",
-				f"Confidence: {step.confidence if step.confidence is not None else 'legacy/unspecified'}",
-				"Parameters:",
-			]
-		)
-		if step.parameters:
-			lines.extend(
-				f"{key}: {value}" for key, value in step.parameters.items()
-			)
-		else:
-			lines.append("{}")
-		lines.append("")
-
-	return "\n".join(lines).rstrip()
+def review_action(
+    step: PlanStep,
+    authorization: AuthorizationResult,
+) -> None:
+    scope = authorization.scope
+    scope_value = (
+        scope.resource_id or scope.selector
+        if scope is not None
+        else "not specified"
+    )
+    print()
+    print("Capability check")
+    print(f"Action: {step.intent.value if step.intent else step.operation}")
+    print(f"Capability: {authorization.capability_id or 'unresolved'}")
+    print(f"Scope: {scope_value}")
+    print(f"Status: {authorization.decision.value}")
 
 
-def format_intent_result(result: IntentCheckResult) -> str:
-	status = "CONSISTENT" if result.consistent else "INCONSISTENT"
-	lines = [
-		"Intent Validation:",
-		"",
-		f"Status: {status}",
-		"",
-		"Reason:",
-		result.reason,
-	]
-	if result.mismatched_steps:
-		lines.extend(["", "Mismatched Steps:", *result.mismatched_steps])
-	return "\n".join(lines)
+def confirm_mutating_action(action: PreparedSkillAction) -> bool:
+    print(f"Target: {action.display_target}")
+    print("This operation changes or removes a file.")
+    return input("Type YES to approve this action:\n> ").strip() == "YES"
 
 
-def format_capabilities(capabilities) -> str:
-	lines = ["Approved Capabilities:", ""]
-	for index, capability in enumerate(capabilities, start=1):
-		lines.append(f"{index}. {capability.capability_id}")
-	return "\n".join(lines)
+def main(*, dry_run: bool = False) -> int:
+    print("Describe the task you want to perform.")
+    if dry_run:
+        print("Preview only; no action will be performed.")
+    user_request = input("> ").strip()
+    if not user_request:
+        print("Enter a task before continuing.")
+        return 1
 
+    try:
+        _, _, results = M1M6Pipeline(
+            review_callback=review_action,
+            approval_callback=confirm_mutating_action,
+        ).run(user_request, dry_run=dry_run)
+    except (
+        CapabilityLifecycleError,
+        M6ExecutionError,
+        SkillRegistryError,
+    ) as error:
+        print(f"Task failed: {error}")
+        return 1
+    except (
+        OllamaError,
+        PlanParsingError,
+        IntentParsingError,
+        CapabilityRegistryError,
+        ValueError,
+    ) as error:
+        print(f"Could not validate the request: {error}")
+        return 1
 
-def format_authorization_results(results) -> str:
-	lines = ["Task Authorization:", ""]
-	for result in results:
-		lines.append(
-			f"{result.task_id}/{result.step_id}: {result.decision.value} "
-			f"({result.capability_id or 'unresolved'})"
-		)
-		lines.append(f"Reason: {result.reason}")
-	return "\n".join(lines)
+    failed = False
+    for result in results:
+        if result.decision == "ASK_CLARIFICATION":
+            print(f"More information is needed: {result.reason}")
+            continue
+        if result.decision == "DENY":
+            print(f"Not authorized: {result.reason}")
+            failed = True
+            continue
+        if result.decision == "ASK_APPROVAL":
+            print("Approval was not granted; no action was performed.")
+            failed = True
+            continue
+        if result.decision == "ERROR":
+            print(f"Action failed: {result.reason}")
+            failed = True
+            continue
+        if result.decision == "DRY_RUN":
+            print(f"Preview: {result.output}")
+            continue
 
-
-def main() -> int:
-	print("# LOCAL-FIRST AI AUTOMATION")
-	user_request = input("Task:\n> ").strip()
-
-	try:
-		plan, intent_result, security_results = M1M5Pipeline().run(user_request)
-	except (
-		OllamaError,
-		PlanParsingError,
-		IntentParsingError,
-		CapabilityRegistryError,
-		ValueError,
-	) as error:
-		print(f"Planning failed: {error}")
-		return 1
-
-	print()
-	print(format_plan(plan))
-	print()
-	print(format_intent_result(intent_result))
-	print()
-	print("M5 Security Results:")
-	for result in security_results:
-		print(f"{result.step_id}: {result.decision} ({result.capability_id or 'unresolved'})")
-		print(f"Reason: {result.reason}")
-	return 0
+        print(f"Result: {result.reason}")
+        if result.output:
+            print(result.output)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-	raise SystemExit(main())
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Local-first permission-aware file automation."
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="check the requested capability and scope without executing",
+    )
+    raise SystemExit(main(dry_run=parser.parse_args().dry_run))
