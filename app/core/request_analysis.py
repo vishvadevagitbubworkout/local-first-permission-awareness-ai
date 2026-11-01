@@ -47,6 +47,12 @@ _VAGUE_CLEANUP = re.compile(
     re.I,
 )
 
+_CONTENT_SEARCH = re.compile(
+    r"\b(?:search|find|look\s+for)\b.{0,80}\b(?:word|text|phrase|content|inside)\b"
+    r"|\b(?:word|text|phrase|content)\b.{0,80}\b(?:search|find)\b",
+    re.I | re.S,
+)
+
 _BULK_DELETION = re.compile(
     r"\b(?:delete|remove|erase)\b.*\b(?:all|every|everything)\b.*"
     r"\b(?:files?|documents?|folders?)\b"
@@ -61,7 +67,23 @@ def _intent_for_action_word(word: str) -> PlannerIntent | None:
     if exact is not None:
         return exact
     close = get_close_matches(normalized, _ALIAS_TO_INTENT, n=2, cutoff=0.8)
-    matching_intents = {_ALIAS_TO_INTENT[alias] for alias in close}
+    matching_aliases = set(close)
+    for alias in _ALIAS_TO_INTENT:
+        if len(normalized) != len(alias):
+            continue
+        mismatches = [
+            index
+            for index, (typed, expected) in enumerate(zip(normalized, alias))
+            if typed != expected
+        ]
+        if (
+            len(mismatches) == 2
+            and mismatches[1] == mismatches[0] + 1
+            and normalized[mismatches[0]] == alias[mismatches[1]]
+            and normalized[mismatches[1]] == alias[mismatches[0]]
+        ):
+            matching_aliases.add(alias)
+    matching_intents = {_ALIAS_TO_INTENT[alias] for alias in matching_aliases}
     return next(iter(matching_intents)) if len(matching_intents) == 1 else None
 
 
@@ -107,6 +129,11 @@ def clarification_for_request(request: str) -> str | None:
             "“Clean up” could mean listing, organizing, renaming, or deleting files. "
             "No files were changed. Specify one exact action and a filename; for "
             "example, ask to list file names or to delete one named file."
+        )
+    if _CONTENT_SEARCH.search(request):
+        return (
+            "Searching inside file contents is not supported yet. No files were "
+            "opened or changed. You can ask to list file names or read one named file."
         )
     if _BULK_DELETION.search(request):
         return (

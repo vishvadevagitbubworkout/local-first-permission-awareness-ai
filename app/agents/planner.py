@@ -133,6 +133,9 @@ class Planner:
 			return self._explicit_directory_listing_plan(user_request)
 		if is_default_directory_listing_request(user_request):
 			return self._default_directory_listing_plan(user_request)
+		multi_step_plan = self._explicit_multi_action_plan(user_request)
+		if multi_step_plan is not None:
+			return multi_step_plan
 		explicit_plan = self._explicit_file_action_plan(user_request)
 		if explicit_plan is not None:
 			return explicit_plan
@@ -197,6 +200,28 @@ class Planner:
 		plan.steps[0].resource = "default workspace"
 		plan.steps[0].description = "List immediate regular-file names in the configured default workspace."
 		return plan
+
+	@classmethod
+	def _explicit_multi_action_plan(cls, user_request: str) -> TaskPlan | None:
+		lines = [line.strip() for line in user_request.splitlines() if line.strip()]
+		if len(lines) < 2:
+			return None
+
+		steps = []
+		for index, line in enumerate(lines, start=1):
+			line_plan = cls._explicit_file_action_plan(line)
+			if line_plan is None or len(line_plan.steps) != 1:
+				return None
+			step = line_plan.steps[0].model_copy(
+				update={"step_id": f"step_{index:03d}"}
+			)
+			steps.append(step)
+
+		return TaskPlan(
+			task_id=cls._new_task_id(),
+			original_request=user_request,
+			steps=steps,
+		)
 
 	@classmethod
 	def _explicit_file_action_plan(cls, user_request: str) -> TaskPlan | None:

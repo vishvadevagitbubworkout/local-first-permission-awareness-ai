@@ -347,7 +347,7 @@ class M1M6Pipeline:
                     expected_task_id=plan.task_id,
                     expected_step_id=step.step_id,
                     expected_agent=step.agent,
-                    expected_operation=capability.claims.operation,
+                    expected_operation=step.operation,
                     expected_resource=step.resource,
                     expected_scope=authorization.scope,
                 )

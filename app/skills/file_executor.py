@@ -99,6 +99,15 @@ class FileSystemExecutor:
         self._working_directory = working_directory
 
     def prepare(self, task_plan: TaskPlan, step: PlanStep) -> PreparedFileAction:
+        prepared = self._resolve_action(task_plan, step)
+        self._preflight(prepared)
+        return prepared
+
+    def _resolve_action(
+        self,
+        task_plan: TaskPlan,
+        step: PlanStep,
+    ) -> PreparedFileAction:
         if not isinstance(task_plan, TaskPlan) or not isinstance(step, PlanStep):
             raise M6ExecutionError("M6 requires a validated task plan and step.")
         if not any(candidate is step for candidate in task_plan.steps):
@@ -128,7 +137,6 @@ class FileSystemExecutor:
                         "Quote exactly one absolute Windows directory or file path in the request."
                     )
                 prepared = self._prepare_from_working_directory(task_plan, step)
-            self._preflight(prepared)
             return prepared
         except M6PathError as error:
             raise M6ExecutionError(str(error)) from error
@@ -184,7 +192,7 @@ class FileSystemExecutor:
             prepared.task_id != task_plan.task_id
             or prepared.step_id != step.step_id
             or prepared.intent != step.intent
-            or prepared != self.prepare(task_plan, step)
+            or prepared != self._resolve_action(task_plan, step)
         ):
             raise M6ExecutionError("The prepared file action no longer matches the task.")
 
