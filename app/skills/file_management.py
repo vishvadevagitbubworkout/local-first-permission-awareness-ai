@@ -35,23 +35,6 @@ class FileManagementSkill:
         )
 
     def execute(self, context: SkillExecutionContext) -> SkillResult:
-        action = context.prepared
-        if (
-            action.skill_id != self.skill_id
-            or action.task_id != context.task_plan.task_id
-            or action.step_id != context.step.step_id
-            or not isinstance(action.payload, PreparedFileAction)
-        ):
-            raise SkillExecutionError(
-                "The prepared action does not match the file-management skill."
-            )
-        result = self._executor.execute(
-            context.authorization,
-            context.capability,
-            context.task_plan,
-            context.step,
-            context.intent_result,
-            action.payload,
-            after_capability_consumed=context.after_capability_consumed,
+        raise SkillExecutionError(
+            "File actions must be dispatched by the mandatory execution gateway."
         )
-        return SkillResult(summary=result.summary, output=result.output)

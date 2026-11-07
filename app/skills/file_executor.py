@@ -34,6 +34,7 @@ _MAX_READ_BYTES = 256 * 1024
 _MAX_WRITE_BYTES = 256 * 1024
 _MAX_LIST_ENTRIES = 2000
 _MAX_DIRECTORY_ENTRIES_SCANNED = 10000
+_GATEWAY_EXECUTION_TOKEN = object()
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _MUTATING_INTENTS = {
     PlannerIntent.CREATE,
@@ -153,7 +154,12 @@ class FileSystemExecutor:
         prepared: PreparedFileAction,
         *,
         after_capability_consumed: Callable[[], None] | None = None,
+        _gateway_token: object | None = None,
     ) -> FileActionResult:
+        if _gateway_token is not _GATEWAY_EXECUTION_TOKEN:
+            raise M6ExecutionError(
+                "File operations must be dispatched by the mandatory execution gateway."
+            )
         if (
             not isinstance(authorization, AuthorizationResult)
             or not authorization.is_integrity_valid()

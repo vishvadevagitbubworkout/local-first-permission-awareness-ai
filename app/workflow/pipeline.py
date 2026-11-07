@@ -28,13 +28,14 @@ from app.skills.file_executor import (
 )
 from app.skills.registry import (
     PreparedSkillAction,
-    SkillExecutionContext,
     SkillExecutionError,
     SkillPreparationError,
 )
 from app.skills.file_management import FileManagementSkill
 from app.skills.registry import SkillRegistry, SkillRegistryError
 from app.core.task_plan import PlanStep
+from app.gateway.execution_gateway import ExecutionGateway
+from app.security.approval import ApprovalManager
 
 
 @dataclass(frozen=True)
@@ -53,7 +54,7 @@ ActionReviewCallback = Callable[
 
 
 class M1M6Pipeline:
-    """Run the real module chain and return an auditable, non-executing result."""
+    """Run the real module chain and dispatch supported actions through the gateway."""
 
     def __init__(self, *, planner=None, validator=None, authorizer=None,
                  minter=None, verifier=None, lifecycle=None, executor=None,
@@ -83,6 +84,18 @@ class M1M6Pipeline:
         )
         self.skills = skill_registry or SkillRegistry(
             [FileManagementSkill(self.executor)]
+        )
+        self.gateway = ExecutionGateway(
+            executor=self.executor,
+            verifier=self.verifier,
+            lifecycle=self.lifecycle,
+            store=self.state_store,
+            audit_trail=self.audit_trail,
+            approval_manager=ApprovalManager(
+                store=self.state_store,
+                key_provider=self.minter._key_provider,
+            ),
+            resolver=self.authorizer.resolver,
         )
         self.review_callback = review_callback
         self.approval_callback = approval_callback
@@ -262,6 +275,26 @@ class M1M6Pipeline:
                     )
                 )
                 continue
+            if step.intent != PlannerIntent.READ:
+                self.audit_trail.record(
+                    "UNSUPPORTED_GATEWAY_OPERATION",
+                    task_id=plan.task_id,
+                    step_id=step.step_id,
+                    request=user_request,
+                    scope=safe_scope,
+                    capability_id=authorization.capability_id,
+                    decision=PermissionDecision.DENY.value,
+                    execution_result="NOT_STARTED",
+                    failure_reason="GATEWAY_SUPPORTS_FILE_READ_ONLY",
+                )
+                results.append(
+                    PipelineStepResult(
+                        step.step_id,
+                        PermissionDecision.DENY.value,
+                        "Execution gateway currently supports FILE_READ only.",
+                    )
+                )
+                continue
             if authorization.decision == PermissionDecision.ASK_APPROVAL:
                 self.audit_trail.record(
                     "APPROVAL_REQUESTED",
@@ -374,46 +407,26 @@ class M1M6Pipeline:
                 token_verification="VERIFIED",
             )
             execution_id = uuid.uuid4().hex
-            execution_started = False
-
-            def record_consumed_capability() -> None:
-                nonlocal execution_started
-                self.state_store.start_execution(
-                    execution_id=execution_id,
-                    task_id=plan.task_id,
-                    step_id=step.step_id,
-                    capability_id=capability.claims.capability_id,
-                    scope=safe_scope,
-                )
-                execution_started = True
 
             try:
-                action_result = skill.execute(
-                    SkillExecutionContext(
-                        authorization=authorization,
-                        capability=verified,
-                        task_plan=plan,
-                        step=step,
-                        intent_result=intent,
-                        prepared=prepared,
-                        after_capability_consumed=record_consumed_capability,
-                    )
+                action_result = self.gateway.execute(
+                    agent_id=step.agent,
+                    task_id=plan.task_id,
+                    subtask_id=step.step_id,
+                    authorization=authorization,
+                    capability=verified,
+                    task_plan=plan,
+                    step=step,
+                    intent_result=intent,
+                    prepared=prepared,
+                    execution_id=execution_id,
                 )
             except (
                 M6ExecutionError,
                 CapabilityLifecycleError,
                 SkillExecutionError,
             ) as error:
-                if execution_started:
-                    self.state_store.finish_execution(
-                        execution_id=execution_id,
-                        task_id=plan.task_id,
-                        step_id=step.step_id,
-                        status="FAILED",
-                        execution_result="FAILED",
-                        failure_reason="EXECUTION_FAILED",
-                    )
-                elif isinstance(error, CapabilityLifecycleError):
+                if isinstance(error, CapabilityLifecycleError):
                     self.audit_trail.record(
                         "TOKEN_LIFECYCLE_REJECTED",
                         task_id=plan.task_id,
@@ -440,13 +453,6 @@ class M1M6Pipeline:
                     )
                 results.append(PipelineStepResult(step.step_id, "ERROR", str(error)))
                 continue
-            self.state_store.finish_execution(
-                execution_id=execution_id,
-                task_id=plan.task_id,
-                step_id=step.step_id,
-                status="COMPLETED",
-                execution_result="SUCCEEDED",
-            )
             results.append(
                 PipelineStepResult(
                     step.step_id,

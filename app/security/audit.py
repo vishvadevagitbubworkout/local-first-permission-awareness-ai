@@ -9,6 +9,11 @@ from app.security.permissions import PermissionScope
 
 
 _QUOTED_TEXT = re.compile(r"""(['"`]).*?\1""", re.S)
+_CREDENTIAL_ASSIGNMENT = re.compile(
+    r"""(?i)\b(password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|authorization)\b"""
+    r"""(\s*[:=]\s*)(?:bearer\s+)?(?:"[^"]*"|'[^']*'|[^\s,;]+)"""
+)
+_BEARER_TOKEN = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]+=*")
 _WINDOWS_PATH = re.compile(r"(?<![\w])[A-Za-z]:[\\/][^\r\n\"'`<>|?*]*")
 _UNC_PATH = re.compile(r"(?<!\S)(?:\\\\|//)[^\s\"'`<>|?*]+")
 _RELATIVE_TRAVERSAL = re.compile(
@@ -20,6 +25,8 @@ _FILE_NAME = re.compile(r"\b[\w.-]+\.[A-Za-z0-9]{1,12}\b", re.I)
 
 
 def redact_sensitive_text(value: str) -> str:
+    value = _CREDENTIAL_ASSIGNMENT.sub(r"\1\2[REDACTED_SECRET]", value)
+    value = _BEARER_TOKEN.sub("Bearer [REDACTED_SECRET]", value)
     value = _QUOTED_TEXT.sub("[REDACTED_TEXT]", value)
     value = _WINDOWS_PATH.sub("[REDACTED_PATH]", value)
     value = _UNC_PATH.sub("[REDACTED_PATH]", value)

@@ -7,7 +7,12 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, PrivateAttr, TypeAdapter
 
 from app.security.permissions import PermissionScope
-from app.security.tokens import AuthenticatedCapability, CapabilityClaims, UsagePolicy
+from app.security.tokens import (
+    MAX_CAPABILITY_LIFETIME,
+    AuthenticatedCapability,
+    CapabilityClaims,
+    UsagePolicy,
+)
 from app.security.tokens import verify_mac
 from app.security.tokens import CapabilityKeyProvider
 
@@ -85,7 +90,12 @@ class CapabilityVerifier:
         current_time = current_time.astimezone(timezone.utc)
         issued_at = authenticated.claims.issued_at.astimezone(timezone.utc)
         expires_at = authenticated.claims.expires_at.astimezone(timezone.utc)
-        if expires_at <= issued_at or current_time >= expires_at:
+        if (
+            issued_at > current_time
+            or expires_at <= issued_at
+            or expires_at - issued_at > MAX_CAPABILITY_LIFETIME
+            or current_time >= expires_at
+        ):
             raise CapabilityVerificationError("capability is expired or has invalid lifetime")
 
         self._check_context(

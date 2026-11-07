@@ -10,11 +10,15 @@ from app.security.capabilities import CapabilityResolver
 from app.security.permissions import AuthorizationResult
 from app.security.permissions import PermissionDecision
 from app.core.task_plan import PlanStep, TaskPlan
-from app.security.tokens import AuthenticatedCapability, CapabilityClaims, UsagePolicy
+from app.security.tokens import (
+    MAX_CAPABILITY_LIFETIME,
+    AuthenticatedCapability,
+    CapabilityClaims,
+    UsagePolicy,
+)
 from app.security.tokens import compute_mac
 from app.security.tokens import CapabilityKeyProvider
 
-_MAX_LIFETIME = timedelta(hours=1)
 _DEFAULT_LIFETIME = timedelta(minutes=5)
 
 
@@ -33,7 +37,7 @@ class CapabilityMintingPolicy(BaseModel):
     @field_validator("lifetime")
     @classmethod
     def validate_lifetime(cls, value: timedelta) -> timedelta:
-        if value <= timedelta(0) or value > _MAX_LIFETIME:
+        if value <= timedelta(0) or value > MAX_CAPABILITY_LIFETIME:
             raise ValueError("capability lifetime must be greater than zero and at most one hour")
         return value
 

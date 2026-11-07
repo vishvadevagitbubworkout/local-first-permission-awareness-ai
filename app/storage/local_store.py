@@ -93,6 +93,36 @@ class LocalAutomationStore:
                         started_at TEXT NOT NULL,
                         ended_at TEXT
                     );
+
+                    CREATE TABLE IF NOT EXISTS gateway_executions (
+                        execution_id TEXT PRIMARY KEY,
+                        run_id TEXT NOT NULL,
+                        task_id TEXT NOT NULL,
+                        step_id TEXT NOT NULL,
+                        capability_id TEXT NOT NULL,
+                        status TEXT NOT NULL CHECK (
+                            status IN ('PENDING', 'SUCCEEDED', 'FAILED', 'UNKNOWN')
+                        ),
+                        started_at TEXT NOT NULL,
+                        ended_at TEXT,
+                        failure_reason TEXT
+                    );
+
+                    CREATE TABLE IF NOT EXISTS approval_lifecycle (
+                        approval_id TEXT PRIMARY KEY,
+                        run_id TEXT NOT NULL,
+                        binding_json TEXT NOT NULL,
+                        binding_digest TEXT NOT NULL,
+                        principal_id TEXT NOT NULL,
+                        issued_at TEXT NOT NULL,
+                        expires_at TEXT NOT NULL,
+                        nonce TEXT NOT NULL,
+                        signature TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK (
+                            state IN ('ACTIVE', 'CONSUMED', 'EXPIRED', 'REVOKED')
+                        ),
+                        updated_at TEXT NOT NULL
+                    );
                     """
                 )
                 self._ensure_execution_columns(connection)
@@ -194,6 +224,15 @@ class LocalAutomationStore:
         for run in runs:
             if self._pid_is_running(run["owner_pid"]):
                 continue
+            connection.execute(
+                """
+                UPDATE gateway_executions
+                SET status='UNKNOWN', ended_at=?,
+                    failure_reason='Owning process ended before outcome was recorded.'
+                WHERE run_id=? AND status='PENDING'
+                """,
+                (self._now(), run["run_id"]),
+            )
             executions = connection.execute(
                 """
                 SELECT execution_id, task_id, step_id, capability_id, scope_json
@@ -352,7 +391,6 @@ class LocalAutomationStore:
                     if current >= expires_at and existing != "REVOKED":
                         existing = "EXPIRED"
                     if row is None:
-                        newly_revoked = state == "REVOKED"
                         connection.execute(
                             """
                             INSERT INTO capability_lifecycle
@@ -544,6 +582,310 @@ class LocalAutomationStore:
         except (sqlite3.Error, OSError, TypeError, ValueError) as error:
             raise LocalStoreError(f"Could not record execution start: {error}") from error
 
+    def start_gateway_execution(
+        self,
+        *,
+        execution_id: str,
+        task_id: str,
+        step_id: str,
+        capability_id: str,
+    ) -> None:
+        try:
+            with closing(self._connect()) as connection:
+                with self._atomic(connection):
+                    connection.execute(
+                        """
+                        INSERT INTO gateway_executions (
+                            execution_id, run_id, task_id, step_id,
+                            capability_id, status, started_at
+                        ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?)
+                        """,
+                        (
+                            execution_id,
+                            self.run_id,
+                            task_id,
+                            step_id,
+                            capability_id,
+                            self._now(),
+                        ),
+                    )
+        except (sqlite3.Error, OSError) as error:
+            raise LocalStoreError(
+                f"Could not reserve gateway execution: {error}"
+            ) from error
+
+    def finish_gateway_execution(
+        self,
+        *,
+        execution_id: str,
+        status: str,
+        failure_reason: str | None = None,
+    ) -> None:
+        if status not in {"SUCCEEDED", "FAILED", "UNKNOWN"}:
+            raise LocalStoreError("Invalid gateway execution terminal status.")
+        try:
+            with closing(self._connect()) as connection:
+                with self._atomic(connection):
+                    cursor = connection.execute(
+                        """
+                        UPDATE gateway_executions
+                        SET status=?, ended_at=?, failure_reason=?
+                        WHERE execution_id=? AND run_id=? AND status='PENDING'
+                        """,
+                        (
+                            status,
+                            self._now(),
+                            failure_reason,
+                            execution_id,
+                            self.run_id,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise LocalStoreError(
+                            "Gateway execution is missing or is no longer pending."
+                        )
+        except (sqlite3.Error, OSError) as error:
+            raise LocalStoreError(
+                f"Could not finish gateway execution: {error}"
+            ) from error
+
+    def get_gateway_execution_state(self, execution_id: str) -> str | None:
+        try:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    """
+                    SELECT status FROM gateway_executions
+                    WHERE execution_id=?
+                    """,
+                    (execution_id,),
+                ).fetchone()
+                return row["status"] if row is not None else None
+        except (sqlite3.Error, OSError) as error:
+            raise LocalStoreError(
+                f"Could not read gateway execution state: {error}"
+            ) from error
+
+    def create_approval(
+        self,
+        *,
+        approval_id: str,
+        binding: dict[str, Any],
+        binding_digest: str,
+        principal_id: str,
+        issued_at: str,
+        expires_at: str,
+        nonce: str,
+        signature: str,
+    ) -> None:
+        binding_json = json.dumps(
+            binding,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        try:
+            with closing(self._connect()) as connection:
+                with self._atomic(connection):
+                    connection.execute(
+                        """
+                        INSERT INTO approval_lifecycle (
+                            approval_id, run_id, binding_json, binding_digest,
+                            principal_id, issued_at, expires_at, nonce,
+                            signature, state, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)
+                        """,
+                        (
+                            approval_id,
+                            self.run_id,
+                            binding_json,
+                            binding_digest,
+                            principal_id,
+                            issued_at,
+                            expires_at,
+                            nonce,
+                            signature,
+                            self._now(),
+                        ),
+                    )
+                    self._append_on_connection(
+                        connection,
+                        event_type="APPROVAL_CREATED",
+                        run_id=self.run_id,
+                        owner_pid=os.getpid(),
+                        task_id=binding.get("task_id"),
+                        step_id=binding.get("step_id"),
+                        capability_id=binding.get("capability_id"),
+                        approval="ACTIVE",
+                        execution_result=binding_digest,
+                    )
+        except (sqlite3.Error, OSError, TypeError, ValueError) as error:
+            raise LocalStoreError(f"Could not persist approval: {error}") from error
+
+    def get_approval_state(
+        self,
+        approval_id: str,
+        *,
+        now: str | None = None,
+    ) -> str | None:
+        try:
+            with closing(self._connect()) as connection:
+                with self._atomic(connection):
+                    row = connection.execute(
+                        """
+                        SELECT state, expires_at, binding_json, binding_digest
+                        FROM approval_lifecycle WHERE approval_id=?
+                        """,
+                        (approval_id,),
+                    ).fetchone()
+                    if row is None:
+                        return None
+                    state = row["state"]
+                    current = now or self._now()
+                    if state == "ACTIVE" and current >= row["expires_at"]:
+                        state = "EXPIRED"
+                        binding = json.loads(row["binding_json"])
+                        connection.execute(
+                            """
+                            UPDATE approval_lifecycle
+                            SET state='EXPIRED', updated_at=?
+                            WHERE approval_id=? AND state='ACTIVE'
+                            """,
+                            (current, approval_id),
+                        )
+                        self._append_on_connection(
+                            connection,
+                            event_type="APPROVAL_STATE_CHANGED",
+                            run_id=self.run_id,
+                            owner_pid=os.getpid(),
+                            task_id=binding.get("task_id"),
+                            step_id=binding.get("step_id"),
+                            capability_id=binding.get("capability_id"),
+                            approval="EXPIRED",
+                            execution_result=row["binding_digest"],
+                        )
+                    return state
+        except (sqlite3.Error, OSError, TypeError, ValueError) as error:
+            raise LocalStoreError(f"Could not read approval state: {error}") from error
+
+    def get_approval_record(self, approval_id: str) -> dict[str, Any] | None:
+        try:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    """
+                    SELECT binding_json, binding_digest, principal_id,
+                           issued_at, expires_at, nonce, signature, state
+                    FROM approval_lifecycle WHERE approval_id=?
+                    """,
+                    (approval_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                return {
+                    "binding": json.loads(row["binding_json"]),
+                    "binding_digest": row["binding_digest"],
+                    "principal_id": row["principal_id"],
+                    "issued_at": row["issued_at"],
+                    "expires_at": row["expires_at"],
+                    "nonce": row["nonce"],
+                    "signature": row["signature"],
+                    "state": row["state"],
+                }
+        except (sqlite3.Error, OSError, ValueError) as error:
+            raise LocalStoreError(f"Could not read approval record: {error}") from error
+
+    def consume_approval(
+        self,
+        *,
+        approval_id: str,
+        binding_digest: str,
+        now: str,
+    ) -> str:
+        try:
+            with closing(self._connect()) as connection:
+                with self._atomic(connection):
+                    row = connection.execute(
+                        """
+                        SELECT state, expires_at, binding_digest, run_id,
+                               binding_json
+                        FROM approval_lifecycle
+                        WHERE approval_id=?
+                        """,
+                        (approval_id,),
+                    ).fetchone()
+                    if row is None:
+                        return "MISSING"
+                    if row["binding_digest"] != binding_digest:
+                        return "INVALID"
+                    if row["state"] != "ACTIVE":
+                        return row["state"]
+                    if now >= row["expires_at"]:
+                        state = "EXPIRED"
+                    else:
+                        state = "CONSUMED"
+                    binding = json.loads(row["binding_json"])
+                    connection.execute(
+                        """
+                        UPDATE approval_lifecycle
+                        SET state=?, updated_at=?
+                        WHERE approval_id=? AND state='ACTIVE'
+                        """,
+                        (state, now, approval_id),
+                    )
+                    self._append_on_connection(
+                        connection,
+                        event_type="APPROVAL_STATE_CHANGED",
+                        run_id=self.run_id,
+                        owner_pid=os.getpid(),
+                        task_id=binding.get("task_id"),
+                        step_id=binding.get("step_id"),
+                        capability_id=binding.get("capability_id"),
+                        approval=state,
+                        execution_result=binding_digest,
+                    )
+                    return "CONSUMED_NOW" if state == "CONSUMED" else state
+        except (sqlite3.Error, OSError, TypeError, ValueError) as error:
+            raise LocalStoreError(f"Could not consume approval: {error}") from error
+
+    def revoke_approval(self, approval_id: str) -> str:
+        try:
+            with closing(self._connect()) as connection:
+                with self._atomic(connection):
+                    row = connection.execute(
+                        """
+                        SELECT state, binding_json, binding_digest
+                        FROM approval_lifecycle WHERE approval_id=?
+                        """,
+                        (approval_id,),
+                    ).fetchone()
+                    if row is None:
+                        return "MISSING"
+                    if row["state"] != "ACTIVE":
+                        return row["state"]
+                    binding = json.loads(row["binding_json"])
+                    connection.execute(
+                        """
+                        UPDATE approval_lifecycle
+                        SET state='REVOKED', updated_at=?
+                        WHERE approval_id=? AND state='ACTIVE'
+                        """,
+                        (self._now(), approval_id),
+                    )
+                    self._append_on_connection(
+                        connection,
+                        event_type="APPROVAL_STATE_CHANGED",
+                        run_id=self.run_id,
+                        owner_pid=os.getpid(),
+                        task_id=binding.get("task_id"),
+                        step_id=binding.get("step_id"),
+                        capability_id=binding.get("capability_id"),
+                        approval="REVOKED",
+                        execution_result=row["binding_digest"],
+                    )
+                    return "REVOKED"
+        except (sqlite3.Error, OSError, TypeError, ValueError) as error:
+            raise LocalStoreError(f"Could not revoke approval: {error}") from error
+
     def finish_execution(
         self,
         *,
@@ -658,6 +1000,15 @@ class LocalAutomationStore:
                         """
                         UPDATE process_runs SET status='CLOSED', ended_at=?
                         WHERE run_id=? AND status='RUNNING'
+                        """,
+                        (self._now(), self.run_id),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE gateway_executions
+                        SET status='UNKNOWN', ended_at=?,
+                            failure_reason='Run closed before outcome was recorded.'
+                        WHERE run_id=? AND status='PENDING'
                         """,
                         (self._now(), self.run_id),
                     )

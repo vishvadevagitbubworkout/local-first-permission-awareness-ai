@@ -7,7 +7,7 @@ import hmac
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping
@@ -211,6 +211,7 @@ def canonicalize_claims(claims: CapabilityClaims) -> bytes:
     return serialized.encode("utf-8")
 
 _MIN_KEY_BYTES = 32
+MAX_CAPABILITY_LIFETIME = timedelta(hours=1)
 
 def _validate_key(secret_key: bytes) -> bytes:
     if not isinstance(secret_key, bytes):
@@ -281,4 +282,5 @@ __all__ = [
     'compute_mac',
     'verify_mac',
     'CapabilityKeyProvider',
+    'MAX_CAPABILITY_LIFETIME',
 ]
